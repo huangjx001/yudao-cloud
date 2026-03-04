@@ -1,0 +1,113 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        // Harbor 地址，例如 harbor.example.com
+        HARBOR_URL = 'harbor.example.com'
+        // Harbor 项目名，例如 yudao
+        HARBOR_PROJECT = 'yudao'
+        // Jenkins 凭据 ID：用户名 + 密码（Harbor 机器人账号也可以）
+        HARBOR_CREDENTIALS_ID = 'harbor-credentials'
+        // 可选：远程部署服务器 SSH 凭据 ID
+        DEPLOY_SSH_CREDENTIALS_ID = 'deploy-ssh'
+    }
+
+    parameters {
+        choice(name: 'MODULE_PATH', choices: [
+                'yudao-server',
+                'yudao-gateway',
+                'yudao-module-system/yudao-module-system-server',
+                'yudao-module-infra/yudao-module-infra-server',
+                'yudao-module-member/yudao-module-member-server',
+                'yudao-module-bpm/yudao-module-bpm-server',
+                'yudao-module-pay/yudao-module-pay-server',
+                'yudao-module-mp/yudao-module-mp-server',
+                'yudao-module-crm/yudao-module-crm-server',
+                'yudao-module-erp/yudao-module-erp-server',
+                'yudao-module-ai/yudao-module-ai-server',
+                'yudao-module-report/yudao-module-report-server'
+        ], description: '要构建的模块路径（目录中需要有 Dockerfile）')
+        string(name: 'IMAGE_NAME', defaultValue: 'yudao-service', description: '镜像名（不含 Harbor 前缀）')
+        string(name: 'IMAGE_TAG', defaultValue: '', description: '镜像 tag，留空则自动使用 BUILD_NUMBER + Git 短 SHA')
+        booleanParam(name: 'DEPLOY_ENABLED', defaultValue: false, description: '是否部署到远程服务器（拉取 Harbor 镜像）')
+        string(name: 'DEPLOY_HOST', defaultValue: '192.168.1.10', description: '部署服务器 IP 或域名')
+        string(name: 'DEPLOY_PORT', defaultValue: '22', description: '部署服务器 SSH 端口')
+        string(name: 'CONTAINER_NAME', defaultValue: 'yudao-service', description: '部署容器名')
+        string(name: 'RUN_ARGS', defaultValue: '-p 48080:48080 --restart=always', description: 'docker run 额外参数')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHORT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.EFFECTIVE_TAG = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : "${env.BUILD_NUMBER}-${env.GIT_SHORT_SHA}"
+                    env.FULL_IMAGE = "${env.HARBOR_URL}/${env.HARBOR_PROJECT}/${params.IMAGE_NAME}:${env.EFFECTIVE_TAG}"
+                    echo "使用镜像标签: ${env.EFFECTIVE_TAG}"
+                    echo "完整镜像地址: ${env.FULL_IMAGE}"
+                }
+            }
+        }
+
+        stage('Build JAR') {
+            steps {
+                sh "mvn -pl ${params.MODULE_PATH} -am clean package -DskipTests"
+            }
+        }
+
+        stage('Build & Push Image') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: env.HARBOR_CREDENTIALS_ID, usernameVariable: 'HARBOR_USER', passwordVariable: 'HARBOR_PASS')]) {
+                    sh '''
+                        set -eux
+                        echo "$HARBOR_PASS" | docker login -u "$HARBOR_USER" --password-stdin "$HARBOR_URL"
+                        docker build -t "$FULL_IMAGE" "$MODULE_PATH"
+                        docker push "$FULL_IMAGE"
+                        docker logout "$HARBOR_URL"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy (Pull from Harbor)') {
+            when {
+                expression { return params.DEPLOY_ENABLED }
+            }
+            steps {
+                withCredentials([
+                        usernamePassword(credentialsId: env.HARBOR_CREDENTIALS_ID, usernameVariable: 'HARBOR_USER', passwordVariable: 'HARBOR_PASS'),
+                        sshUserPrivateKey(credentialsId: env.DEPLOY_SSH_CREDENTIALS_ID, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')
+                ]) {
+                    sh '''
+                        set -eux
+                        ssh -i "$SSH_KEY" -p "$DEPLOY_PORT" -o StrictHostKeyChecking=no "$SSH_USER@$DEPLOY_HOST" \
+                        "echo '$HARBOR_PASS' | docker login -u '$HARBOR_USER' --password-stdin '$HARBOR_URL' && \
+                         docker pull '$FULL_IMAGE' && \
+                         docker rm -f '$CONTAINER_NAME' || true && \
+                         docker run -d --name '$CONTAINER_NAME' $RUN_ARGS '$FULL_IMAGE' && \
+                         docker image prune -f"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "构建成功：${env.FULL_IMAGE}"
+        }
+        failure {
+            echo '构建失败，请检查日志。'
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
